@@ -17,6 +17,10 @@ import pymorphy3
 
 session = scoped_session(sessionmaker(bind=engine))
 
+# Единый классификатор, переиспользуемый и в /classify, и в /recommendations,
+# чтобы не обучать модель заново с нуля в каждом маршруте.
+classifier = NaiveBayesClassifier(alpha=0.1)
+
 
 @route("/")
 def home():
@@ -76,12 +80,30 @@ def update_news():
         if __name__ == "__main__":
             redirect("/news")
 
-
     finally:
         s.close()
 
 
-classifier = NaiveBayesClassifier(alpha=0.1)
+def _train_classifier(s):
+    """Обучает глобальный классификатор на всех размеченных новостях.
+
+    Возвращает True, если обучение прошло успешно (есть данные хотя бы
+    двух классов), иначе False.
+    """
+    labeled_news = s.query(News).filter(News.label != None).all()
+
+    X = [
+        f"{news.title or ''} {news.author or ''}"
+        for news in labeled_news
+        if news.label is not None and news.title is not None
+    ]
+    y = [news.label for news in labeled_news if news.label is not None and news.title is not None]
+
+    if len(X) < 2 or len(set(y)) < 2:
+        return False
+
+    classifier.fit(X, y)
+    return True
 
 
 def classify_news():
@@ -101,9 +123,6 @@ def classify_news():
         print("Not enough labeled data for classification")
         return []
 
-    # ИСПРАВЛЕНИЕ: Проверка минимального количества образцов для стратификации
-    from collections import Counter
-
     class_counts = Counter(y)
     stratify = y if all(c >= 2 for c in class_counts.values()) else None
 
@@ -111,6 +130,7 @@ def classify_news():
     classifier.fit(X_train, y_train)
     test_accuracy = classifier.score(X_test, y_test)
     print(f"Model accuracy: {test_accuracy:.2f}")
+    # Дообучаем на всех размеченных данных перед финальным предсказанием
     classifier.fit(X, y)
 
     unlabeled_news = s.query(News).filter(News.label == None).all()
@@ -137,7 +157,6 @@ def classify_news_view():
     s = session()
     try:
         news = classify_news()
-        # Передаем объекты News напрямую, не преобразуя в словари
         return template("new_template2", rows=news)
     finally:
         s.close()
@@ -147,33 +166,26 @@ def classify_news_view():
 def recommendations():
     """Возвращает шаблон страницы с рекомендованными новостями."""
     s = session()
+    try:
+        if not _train_classifier(s):
+            return "No labeled news to train the classifier."
 
-    labeled_news = s.query(News).filter(News.label != None).all()
+        unlabeled_news = s.query(News).filter(News.label == None).all()
+        X_new = [f"{news.title or ''} {news.author or ''}" for news in unlabeled_news]
 
-    if not labeled_news:
-        return "No labeled news to train the classifier."
+        if not X_new:
+            return template("news_template3", rows=[])
 
-    # Prepare training data by title + author
-    # and labels for the classifier
-    X_train = [news.title + ' ' + news.author for news in labeled_news]
-    y_train = [news.label for news in labeled_news]
+        predictions = classifier.predict(X_new)
+        good_news = []
+        for news, pred in zip(unlabeled_news, predictions):
+            if pred == "good":
+                news._label = pred  # pylint: disable=protected-access
+                good_news.append(news)
 
-    # Train the classifier
-    classifier = NaiveBayesClassifier()
-    classifier.fit(X_train, y_train)
-
-    # 1. Получить список неразмеченных новостей из БД
-    unlabeled_news = s.query(News).filter(News.label == None).all()
-
-    X_new = [f"{news.title or ''} {news.author or ''}" for news in unlabeled_news]
-
-    classified = classifier.predict(X_new)
-    good_news = []
-    for news, pred in zip(unlabeled_news, classified):
-        if pred == "good":
-            news._label = pred  # pylint: disable=protected-access
-            good_news.append(news)
-    return template('news_template3', rows=good_news)
+        return template("news_template3", rows=good_news)
+    finally:
+        s.close()
 
 
 if __name__ == "__main__":
